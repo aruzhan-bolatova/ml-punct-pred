@@ -9,8 +9,9 @@ import pandas as pd
 from pathlib import Path
 from typing import List
 from tqdm import tqdm
+import numpy as np
 
-from src.config import MODELS, MODEL_HF_IDS, TOKEN_IDX, ID2LABEL
+from src.config import MODELS, MODEL_HF_IDS, TOKEN_IDX, ID2LABEL, PUNCTUATION_DICT
 
 
 def build_sequences_for_inference(words: List[str], tokenizer, sequence_len: int, token_style: str):
@@ -119,7 +120,11 @@ def run_test(
     use_crf: If None, auto-detect from config.pt in save dir.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    test_df = pd.read_csv(test_path)
+    path = Path(test_path)
+    if path.suffix in (".parquet", ".pq"):
+        test_df = pd.read_parquet(test_path)
+    else:
+        test_df = pd.read_csv(test_path)
 
     # Auto-detect settings from config.pt (use_crf, model_name, sequence_length)
     save_dir = Path(weight_path).parent
@@ -150,7 +155,7 @@ def run_test(
 
     predictions = []
     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Predicting"):
-        rid = row["id"]
+        rid = row.get("id", row.name)
         inp = str(row["input_text"])
         labels_str = predict_sentence(
             inp, model, tokenizer, device,
@@ -166,3 +171,86 @@ def run_test(
         out_df.to_csv(out_path, index=False)
         print(f"Saved {len(out_df)} predictions to {out_path}")
     return out_df
+
+
+def evaluate_on_test(
+    test_path: str,
+    weight_path: str = "./out/best.pt",
+    model_name: str = "xlm-roberta-base",
+    sequence_len: int = None,
+    use_crf: bool = None,
+) -> dict:
+    """
+    Evaluate model on labeled test data (test.parquet or csv with input_text + labels).
+    Returns metrics dict: accuracy, macro_f1, f1, precision, recall.
+    """
+    from src.metrics import compute_metrics
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    path = Path(test_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Test data not found: {test_path}")
+    if path.suffix in (".parquet", ".pq"):
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path)
+
+    save_dir = Path(weight_path).parent
+    config_path = save_dir / "config.pt"
+    if config_path.exists():
+        config = torch.load(config_path, map_location="cpu", weights_only=False)
+        if use_crf is None:
+            use_crf = config.get("use_crf", False)
+        if "model_name" in config:
+            model_name = config["model_name"]
+        if sequence_len is None and "sequence_length" in config:
+            sequence_len = config["sequence_length"]
+    if use_crf is None:
+        use_crf = False
+    if sequence_len is None:
+        sequence_len = 128
+
+    _, tokenizer_cls, _, token_style = MODELS[model_name]
+    hf_id = MODEL_HF_IDS.get(model_name, model_name)
+    tokenizer = tokenizer_cls.from_pretrained(hf_id)
+    try:
+        from src.model import DeepPunctuation, DeepPunctuationCRF
+    except ImportError:
+        from model import DeepPunctuation, DeepPunctuationCRF
+    model = DeepPunctuationCRF(model_name) if use_crf else DeepPunctuation(model_name)
+    model.load_state_dict(torch.load(weight_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    text_col = "input_text" if "input_text" in df.columns else df.columns[0]
+    label_col = "labels" if "labels" in df.columns else df.columns[1]
+
+    y_true_list, y_pred_list = [], []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating"):
+        inp = str(row[text_col]).strip()
+        true_str = str(row[label_col]).strip()
+        true_labels = [lbl.upper().strip() for lbl in true_str.split()]
+        if len(inp.split()) != len(true_labels) or not inp:
+            continue
+        pred_str = predict_sentence(
+            inp, model, tokenizer, device,
+            sequence_len=sequence_len,
+            token_style=token_style,
+            use_crf=use_crf,
+        )
+        pred_labels = [lbl.upper().strip() for lbl in pred_str.split()]
+        n = min(len(true_labels), len(pred_labels))
+        if n == 0:
+            continue
+        for i in range(n):
+            y_true_list.append(PUNCTUATION_DICT.get(true_labels[i], 0))
+            y_pred_list.append(PUNCTUATION_DICT.get(pred_labels[i], 0))
+
+    y_true = np.array(y_true_list)
+    y_pred = np.array(y_pred_list)
+    metrics = compute_metrics(y_true, y_pred, num_classes=4, exclude_class_0_for_macro=True)
+    print(f"Test split metrics ({len(df)} examples, {len(y_true)} tokens):")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
+    print(f"  Macro F1 (excl O): {metrics['macro_f1']:.4f}")
+    print(f"  Micro F1: {metrics['f1']:.4f}")
+    return metrics

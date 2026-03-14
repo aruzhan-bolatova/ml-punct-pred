@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--save-path", type=str, default="./out",
                         help="Where to save checkpoints and logs")
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--sequence-length", type=int, default=128)
+    parser.add_argument("--sequence-length", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--unfreeze-lr", type=float, default=None,
@@ -41,6 +41,8 @@ def parse_args():
                         help="Freeze BERT for all epochs (overrides two-phase)")
     parser.add_argument("--lstm-dim", type=int, default=-1,
                         help="-1 = use BERT hidden size")
+    parser.add_argument("--lstm-layers", type=int, default=2,
+                        help="Number of BiLSTM layers")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout after BiLSTM")
     parser.add_argument("--use-crf", action="store_true",
@@ -126,7 +128,7 @@ def main():
     phase2_epochs = args.epochs - phase1_epochs if use_two_phase else 0
 
     # Model: start with frozen BERT (phase 1)
-    model = DeepPunctuationCRF(model_name, freeze_bert=True, lstm_dim=args.lstm_dim, dropout=args.dropout) if args.use_crf else DeepPunctuation(model_name, freeze_bert=True, lstm_dim=args.lstm_dim, dropout=args.dropout)
+    model = DeepPunctuationCRF(model_name, freeze_bert=True, lstm_dim=args.lstm_dim, dropout=args.dropout, lstm_layers=args.lstm_layers) if args.use_crf else DeepPunctuation(model_name, freeze_bert=True, lstm_dim=args.lstm_dim, dropout=args.dropout, lstm_layers=args.lstm_layers)
     model.to(device)
 
     # Optimizer: transformer 2e-5, classifier/LSTM 1e-4
@@ -134,10 +136,21 @@ def main():
     lr_classifier = 1e-4
     if args.use_crf:
         bert_params = list(model.bert_lstm.bert_layer.parameters())
-        other_params = list(model.bert_lstm.lstm.parameters()) + list(model.bert_lstm.layer_norm.parameters()) + list(model.bert_lstm.linear.parameters()) + list(model.crf.parameters())
+        other_params = (
+            list(model.bert_lstm.lstm.parameters())
+            + list(model.bert_lstm.residual_proj.parameters())
+            + list(model.bert_lstm.layer_norm.parameters())
+            + list(model.bert_lstm.classifier.parameters())
+            + list(model.crf.parameters())
+        )
     else:
         bert_params = list(model.bert_layer.parameters())
-        other_params = list(model.lstm.parameters()) + list(model.layer_norm.parameters()) + list(model.linear.parameters())
+        other_params = (
+            list(model.lstm.parameters())
+            + list(model.residual_proj.parameters())
+            + list(model.layer_norm.parameters())
+            + list(model.classifier.parameters())
+        )
     optimizer = torch.optim.AdamW([
         {"params": bert_params, "lr": lr_transformer},
         {"params": other_params, "lr": lr_classifier},

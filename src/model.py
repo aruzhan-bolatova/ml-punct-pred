@@ -19,7 +19,7 @@ except ImportError:
 
 
 class DeepPunctuation(nn.Module):
-    """BERT/RoBERTa + BiLSTM + LayerNorm + Dropout + Linear classifier."""
+    """BERT/RoBERTa + BiLSTM + residual + LayerNorm + MLP classifier."""
 
     def __init__(
         self,
@@ -27,6 +27,7 @@ class DeepPunctuation(nn.Module):
         freeze_bert: bool = False,
         lstm_dim: int = -1,
         dropout: float = 0.1,
+        lstm_layers: int = 2,
     ):
         super().__init__()
         model_id = MODEL_HF_IDS.get(pretrained_model, pretrained_model)
@@ -38,30 +39,34 @@ class DeepPunctuation(nn.Module):
                 p.requires_grad = False
 
         hidden_size = bert_dim if lstm_dim == -1 else lstm_dim
+        lstm_output_dim = hidden_size * 2  # bidirectional
         self.lstm = nn.LSTM(
             input_size=bert_dim,
             hidden_size=hidden_size,
-            num_layers=1,
+            num_layers=lstm_layers,
             bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0,
         )
-        self.layer_norm = nn.LayerNorm(hidden_size * 2)
+        self.residual_proj = nn.Linear(bert_dim, lstm_output_dim)
+        self.layer_norm = nn.LayerNorm(lstm_output_dim)
         self.dropout = nn.Dropout(dropout)
         self.num_labels = len(PUNCTUATION_DICT)
-        self.linear = nn.Linear(hidden_size * 2, self.num_labels)
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_output_dim, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, self.num_labels),
+        )
 
     def forward(self, x, attn_masks):
         if len(x.shape) == 1:
             x = x.unsqueeze(0)
-        # (B, N) -> (B, N, E)
-        x = self.bert_layer(x, attention_mask=attn_masks)[0]
-        # (B, N, E) -> (N, B, E)
-        x = x.transpose(0, 1)
-        x, _ = self.lstm(x)
-        # (N, B, E) -> (B, N, E)
-        x = x.transpose(0, 1)
-        x = self.layer_norm(x)
+        bert_out = self.bert_layer(x, attention_mask=attn_masks)[0]
+        lstm_out, _ = self.lstm(bert_out.transpose(0, 1))
+        lstm_out = lstm_out.transpose(0, 1)
+        x = self.layer_norm(lstm_out + self.residual_proj(bert_out))
         x = self.dropout(x)
-        return self.linear(x)
+        return self.classifier(x)
 
 
 class DeepPunctuationCRF(nn.Module):
@@ -73,12 +78,17 @@ class DeepPunctuationCRF(nn.Module):
         freeze_bert: bool = False,
         lstm_dim: int = -1,
         dropout: float = 0.1,
+        lstm_layers: int = 2,
     ):
         super().__init__()
         if CRF is None:
             raise ImportError("Install pytorch-crf: pip install pytorch-crf")
         self.bert_lstm = DeepPunctuation(
-            pretrained_model, freeze_bert=freeze_bert, lstm_dim=lstm_dim, dropout=dropout
+            pretrained_model,
+            freeze_bert=freeze_bert,
+            lstm_dim=lstm_dim,
+            dropout=dropout,
+            lstm_layers=lstm_layers,
         )
         self.num_labels = self.bert_lstm.num_labels
         self.crf = CRF(self.num_labels, batch_first=True)
