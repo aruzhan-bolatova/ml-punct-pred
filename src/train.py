@@ -13,10 +13,11 @@ import torch.nn as nn
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from collections import Counter
 
 from src.config import MODELS, PUNCTUATION_DICT, MODEL_HF_IDS
 from src.dataset import KazakhPunctDataset
-from src.model import DeepPunctuation
+from src.model import DeepPunctuation, DeepPunctuationCRF
 from src.metrics import compute_metrics_from_batches
 
 
@@ -33,13 +34,37 @@ def parse_args():
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--freeze-bert", action="store_true", help="Freeze BERT layers")
+    parser.add_argument("--unfreeze-lr", type=float, default=None,
+                        help="LR for phase 2 (unfrozen BERT). Default: lr * 0.1")
+    parser.add_argument("--freeze-bert", action="store_true",
+                        help="Freeze BERT for all epochs (overrides two-phase)")
     parser.add_argument("--lstm-dim", type=int, default=-1,
                         help="-1 = use BERT hidden size")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="Dropout after BiLSTM")
+    parser.add_argument("--use-crf", action="store_true",
+                        help="Use CRF layer for sequence-aware predictions")
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cuda", action="store_true", default=True)
     return parser.parse_args()
+
+
+def compute_class_weights(train_dataset):
+    """Compute inverse-frequency class weights for imbalanced loss."""
+    counts = Counter()
+    for item in train_dataset.data:
+        _, y, _, y_mask = item
+        for i, m in enumerate(y_mask):
+            if m == 1 and 0 <= y[i] < len(PUNCTUATION_DICT):
+                counts[y[i]] += 1
+    total = sum(counts.values())
+    num_classes = len(PUNCTUATION_DICT)
+    weights = torch.ones(num_classes)
+    for c in range(num_classes):
+        if counts[c] > 0:
+            weights[c] = total / (num_classes * counts[c])
+    return weights
 
 
 def main():
@@ -83,6 +108,10 @@ def main():
         token_style=token_style,
     )
 
+    # Class weights for imbalanced loss (non-CRF)
+    class_weights = compute_class_weights(train_dataset).to(device)
+    print(f"Class weights: {class_weights.tolist()}")
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
     )
@@ -90,14 +119,16 @@ def main():
         val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
 
-    # Model
-    model = DeepPunctuation(
-        model_name,
-        freeze_bert=args.freeze_bert,
-        lstm_dim=args.lstm_dim,
-    )
+    # Two-phase training: first half freeze BERT, second half unfreeze
+    use_two_phase = not args.freeze_bert
+    phase1_epochs = args.epochs // 2 if use_two_phase else args.epochs
+    phase2_epochs = args.epochs - phase1_epochs if use_two_phase else 0
+
+    # Model: start with frozen BERT (phase 1)
+    model = DeepPunctuationCRF(model_name, freeze_bert=True, lstm_dim=args.lstm_dim, dropout=args.dropout) if args.use_crf else DeepPunctuation(model_name, freeze_bert=True, lstm_dim=args.lstm_dim, dropout=args.dropout)
     model.to(device)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+
+    criterion = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Training
@@ -107,7 +138,20 @@ def main():
         f.write(str(args) + "\n")
 
     best_macro_f1 = 0.0
+    # Save config for inference (whether CRF was used)
+    torch.save({"use_crf": args.use_crf, "model_name": model_name}, os.path.join(args.save_path, "config.pt"))
+
     for epoch in range(args.epochs):
+        # Two-phase: unfreeze BERT at start of phase 2
+        if use_two_phase and epoch == phase1_epochs:
+            bert = model.bert_lstm.bert_layer if args.use_crf else model.bert_layer
+            for p in bert.parameters():
+                p.requires_grad = True
+            unfreeze_lr = args.unfreeze_lr if args.unfreeze_lr is not None else args.lr * 0.1
+            for pg in optimizer.param_groups:
+                pg["lr"] = unfreeze_lr
+            print(f"[Phase 2] Unfreezing BERT, lr={unfreeze_lr}")
+
         model.train()
         train_loss = 0.0
         correct, total = 0, 0
@@ -118,19 +162,24 @@ def main():
             y_mask = batch["label_mask"].to(device)
 
             optimizer.zero_grad()
-            logits = model(x, att)
-            # Flatten for loss; ignore padding via -100
-            flat_logits = logits.view(-1, num_classes)
-            flat_labels = y.view(-1).clone()
-            flat_labels[~y_mask.view(-1).bool()] = -100
-            loss = criterion(flat_logits, flat_labels)
+            if args.use_crf:
+                loss = model.log_likelihood(x, att, y)
+                pred = model.decode(x, att)
+            else:
+                logits = model(x, att)
+                flat_logits = logits.view(-1, num_classes)
+                flat_labels = y.view(-1).clone()
+                flat_labels[~y_mask.view(-1).bool()] = -100
+                loss = criterion(flat_logits, flat_labels)
+                pred = torch.argmax(logits, dim=-1)
+
             loss.backward()
             if args.gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
             optimizer.step()
 
             train_loss += loss.item()
-            pred = torch.argmax(logits, dim=-1).view(-1)
+            pred = pred.view(-1)
             mask = y_mask.view(-1).bool()
             correct += (pred[mask] == y.view(-1)[mask]).sum().item()
             total += mask.sum().item()
@@ -153,14 +202,18 @@ def main():
                 y = batch["labels"].to(device)
                 y_mask = batch["label_mask"].to(device)
 
-                logits = model(x, att)
-                flat_logits = logits.view(-1, num_classes)
-                flat_labels = y.view(-1).clone()
-                flat_labels[~y_mask.view(-1).bool()] = -100
-                loss = criterion(flat_logits, flat_labels)
-                val_loss += loss.item()
+                if args.use_crf:
+                    pred = model.decode(x, att)
+                    loss = model.log_likelihood(x, att, y)
+                else:
+                    logits = model(x, att)
+                    pred = torch.argmax(logits, dim=-1)
+                    flat_logits = logits.view(-1, num_classes)
+                    flat_labels = y.view(-1).clone()
+                    flat_labels[~y_mask.view(-1).bool()] = -100
+                    loss = criterion(flat_logits, flat_labels)
 
-                pred = torch.argmax(logits, dim=-1)
+                val_loss += loss.item()
                 all_preds.append(pred.cpu().numpy())
                 all_labels.append(y.cpu().numpy())
                 all_masks.append(y_mask.cpu().numpy())
