@@ -121,15 +121,18 @@ def run_test(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     test_df = pd.read_csv(test_path)
 
-    # Auto-detect use_crf from config.pt
+    # Auto-detect settings from config.pt (use_crf, model_name, sequence_length)
     save_dir = Path(weight_path).parent
     config_path = save_dir / "config.pt"
-    if use_crf is None and config_path.exists():
+    if config_path.exists():
         config = torch.load(config_path, map_location="cpu", weights_only=False)
-        use_crf = config.get("use_crf", False)
+        if use_crf is None:
+            use_crf = config.get("use_crf", False)
         if "model_name" in config:
             model_name = config["model_name"]
-    elif use_crf is None:
+        if "sequence_length" in config:
+            sequence_len = config["sequence_length"]
+    if use_crf is None:
         use_crf = False
 
     # Load model
