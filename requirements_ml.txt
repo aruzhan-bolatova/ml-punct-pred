@@ -1,0 +1,9 @@
+# ML pipeline for Kazakh punctuation restoration
+# Reference: https://github.com/habib-wahid/punctuation-restoration
+
+torch>=2.0
+transformers>=4.30
+pandas>=1.5
+pyarrow>=12.0
+tqdm>=4.65
+numpy>=1.24
